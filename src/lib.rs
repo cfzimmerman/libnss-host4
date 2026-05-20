@@ -1,9 +1,16 @@
 #![no_std]
 
+mod buf;
+pub mod err;
+
 use core::{
     ffi::CStr,
-    mem::MaybeUninit,
     net::{Ipv4Addr, Ipv6Addr},
+};
+
+use crate::{
+    buf::Gaih4Buf,
+    err::{NssErr, NssStatus},
 };
 
 /// An address that can be returned from gethostbyname4_r.
@@ -15,120 +22,6 @@ pub enum Addr {
         /// Zero is a safe default if you don't know what to put here.
         scope_id: u32,
     },
-}
-
-pub type NssRes<T> = Result<T, NssErr>;
-
-/// Contains the return information passed by this plugin
-/// through the NSS API.
-///
-/// Some common constants are defined, but feel free to
-/// construct your own as well.
-pub struct NssErr {
-    /// A standard libc error.
-    c_err: i32,
-    nss: NssStatus,
-    dns: DnsStatus,
-}
-
-impl NssErr {
-    /// The command succeeded. No error.
-    pub const SUCCESS: Self = Self {
-        c_err: 0,
-        nss: NssStatus::Success,
-        dns: DnsStatus::Success,
-    };
-
-    /// This can be returned when the plugin successfully ran and found
-    /// no matches for the hostname.
-    pub const NO_RESULT: Self = Self {
-        c_err: 0,
-        nss: NssStatus::NotFound,
-        dns: DnsStatus::NoData,
-    };
-
-    /// For example, a hostname is not valid UTF-8, which is expected
-    /// by this library and most (all?) DNS services.
-    pub const INVALID_HOSTNAME: Self = Self {
-        c_err: libc::EINVAL,
-        nss: NssStatus::Unavailable,
-        dns: DnsStatus::NoRecovery,
-    };
-
-    /// This is a suitable return type for total plugin failure. For example,
-    /// if you're relying on unix sockets to communicate with a DNS server and
-    /// there are failures talking to the server.
-    pub const PLUGIN_FAILED: Self = Self {
-        // IO is somewhat questionable here. Feel free to overwrite it
-        // with something more appropriate for your context.
-        c_err: libc::EIO,
-        nss: NssStatus::Unavailable,
-        dns: DnsStatus::NoRecovery,
-    };
-
-    /// The buffer containing requests results was too small. Retrying
-    /// with a larger buffer may succeed.
-    const BUF_TOO_SMALL: Self = Self {
-        c_err: libc::EAGAIN,
-        nss: NssStatus::TryAgain,
-        dns: DnsStatus::TryAgain,
-    };
-
-    /// Writes error state to return pointers and yields the appropriate
-    /// NSS exit code for this error.
-    fn bail(self, errnop: &mut libc::c_int, h_errnop: &mut libc::c_int) -> libc::c_int {
-        *errnop = self.c_err;
-        *h_errnop = self.dns as i32;
-        self.nss as i32
-    }
-}
-
-/// Return status of an NSS function call.
-///
-/// Defined here:
-/// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/nss/nss.h#L30-L38>
-pub enum NssStatus {
-    /// This service is temporarily unusable. For example, the given address
-    /// buffer is too small or the backing DNS service is overloaded.
-    TryAgain = -2,
-
-    /// Plugin failure. For example, IPC or connectivity to some backing
-    /// DNS service failed.
-    Unavailable,
-
-    /// The query completed successfully without returning any matching hosts.
-    /// Pairs with [`DnsStatus::HostNotFound`].
-    NotFound,
-
-    /// Request succeeded. Caller should check PAT list.
-    Success,
-    //
-    // Don't use `RETURN`? nss-mdns never does, and some cursory searching
-    // suggests plugins should not return this value.
-    // Return,
-}
-
-/// Defined here. Comments copied verbatim:
-///
-/// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/resolv/netdb.h#L62-L75>
-pub enum DnsStatus {
-    /// See errno.
-    Internal = -1,
-
-    /// No problem
-    Success,
-
-    /// Authoritative Answer Host not found.
-    HostNotFound,
-
-    /// Non-Authoritative Host not found or SERVERFAIL.
-    TryAgain,
-
-    /// Non recoverable errors, FORMERR, REFUSED, NOTIMP.
-    NoRecovery,
-
-    /// Valid name, no data record of requested type.
-    NoData,
 }
 
 /// GETHOSTBYNAME4_R
@@ -192,18 +85,24 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
     // https://github.com/avahi/nss-mdns/blob/3292b172ce0100a1aed8b67c381760bc3fb87f2e/src/nss.c#L164
     ttlp: *mut libc::c_int,
 ) -> libc::c_int {
+    if name == core::ptr::null()
+        || pat == core::ptr::null_mut()
+        || buffer == core::ptr::null_mut()
+        || errnop == core::ptr::null_mut()
+        || h_errnop == core::ptr::null_mut()
+    // Allow null ttlp
+    {
+        return NssStatus::Unavailable as i32;
+    }
+
     let hostname = unsafe {
-        // The contract is that name is a c string. We have to trust that.
+        // Hostname is a valid c string.
         CStr::from_ptr(name)
     };
-    let pat = unsafe {
-        // The caller must give us a legit pointer. Otherwise there's no place
-        // their results could be stored. This is again part of the API contract.
-        &mut *pat
-    };
-    let (errnop, h_errnop, ttlp) = unsafe {
-        // Again we just have to trust these are safe to use.
-        (&mut *errnop, &mut *h_errnop, &mut *ttlp)
+
+    let (pat, errnop, h_errnop) = unsafe {
+        // These are required inputs.
+        (&mut *pat, &mut *errnop, &mut *h_errnop)
     };
 
     let maybe_buf = unsafe {
@@ -217,12 +116,8 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
     };
 
     let Ok(hostname) = hostname.to_str() else {
-        return NssErr::INVALID_HOSTNAME.bail(errnop, h_errnop);
+        return NssErr::INVALID_INPUT.bail(errnop, h_errnop);
     };
-
-    if let Some(user_ttlp) = ToDo::set_ttlp(hostname) {
-        *ttlp = user_ttlp;
-    }
 
     let addrs = match ToDo::resolve_host(hostname) {
         Ok(res) => res,
@@ -234,6 +129,14 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
         count += 1;
         if !buffer.push(addr) {
             return NssErr::BUF_TOO_SMALL.bail(errnop, h_errnop);
+        }
+    }
+
+    if ttlp != core::ptr::null_mut() {
+        if let Some(user_ttlp) = ToDo::set_ttlp(hostname) {
+            unsafe {
+                *ttlp = user_ttlp;
+            }
         }
     }
 
@@ -271,7 +174,6 @@ pub struct GaihAddrTuple {
     next: *mut GaihAddrTuple,
     name: *const libc::c_char,
     family: libc::c_int,
-    // This is actually defined as [int; 4], but I don't expect FFI will mind this...
     addr: [libc::c_uint; 4],
     scope_id: libc::c_uint,
 }
@@ -326,186 +228,3 @@ impl GaihAddrTuple {
         pat
     }
 }
-/*
-https://github.com/avahi/nss-mdns/blob/3292b172ce0100a1aed8b67c381760bc3fb87f2e/src/avahi.c#L108
-*/
-
-/// This is the buffer into which gethostbyname4_r results are accumulated.
-///
-/// gethostbyname4_r passes a buffer where results should be written. Those
-/// results include the resolved hostname and a linked list of address
-/// nodes. This struct is effectively a single-purpose allocator for
-/// constructing the gethostbyname4_r return type.
-struct Gaih4Buf<'a> {
-    hostname: *const libc::c_char,
-    addrs: &'a mut [MaybeUninit<GaihAddrTuple>],
-    addrs_len: usize,
-    maybe_head: &'a mut *mut GaihAddrTuple,
-    set_head: bool,
-}
-
-impl<'a> Gaih4Buf<'a> {
-    /// Constructs a new buffer for accumulating address results.
-    ///
-    /// Safety:
-    /// - hostname should point exactly to the cstring that was given
-    ///   to gethostbyname4_r.
-    /// - buffer should be exactly the buffer provided to gethostbyname4_r.
-    /// - maybe_head should be exactly the `pat` provided to gethostbyname4_r.
-    ///
-    /// If these are satisfied, then safety depends upon whoever called
-    /// gethostbyname4_r.
-    //
-    // Steps:
-    // - Writes the hostname string into the front of the buffer.
-    //   every entry in the buffer will reference that hostname
-    //   pointer.
-    // - Defines an aligned section of the buffer after the hostname
-    //   into which addr results are written.
-    // - Returns that as a special buffer into which results can be
-    //   accumulated.
-    pub unsafe fn try_new(
-        hostname: &CStr,
-        maybe_head: &'a mut *mut GaihAddrTuple,
-        buffer: *mut libc::c_char,
-        buf_len: libc::size_t,
-    ) -> NssRes<Self> {
-        assert_ne!(buffer, core::ptr::null_mut(), "buffer is not null");
-
-        let (hostname, name_len) = {
-            let hostname = hostname.to_bytes_with_nul();
-            let host_len = hostname.len();
-            if buf_len < host_len {
-                return Err(NssErr::BUF_TOO_SMALL);
-            }
-
-            unsafe {
-                // This safety depends on the following:
-                // - Hostname was a well-formed C string of entirely initialized memory.
-                // - Buffer is a safe buffer of length buflen.
-                //
-                // Both of these are NSS API contracts, so we have to just trust the caller.
-                // Only copying bytes, so alignment is one.
-                core::ptr::copy_nonoverlapping(hostname.as_ptr(), buffer.cast(), host_len);
-            };
-
-            (buffer as *const libc::c_char, host_len)
-        };
-
-        let offset_bytes = name_len.next_multiple_of(core::mem::align_of::<GaihAddrTuple>());
-        let arr_len = buf_len.saturating_sub(offset_bytes) / core::mem::size_of::<GaihAddrTuple>();
-
-        let addrs = if arr_len == 0 {
-            // Even if we can't store anything in the buffer, we should proceed because
-            // there could be space in `maybe_head`. We might also not need space in
-            // the buffer if resolution fails for some other reason.
-            &mut []
-        } else {
-            // Offset is a usize, so this only fails if isize::MAX < offset.
-            // That should never happen in reality, but this gives a more
-            // mathematically robust API.
-            let offset_bytes = isize::try_from(offset_bytes).unwrap_or(isize::MAX);
-
-            let arr_start = unsafe {
-                // This offset is guaranteed to point to allocated memory because
-                // offset and therefore arr_len are nonzero.
-                buffer.offset(offset_bytes)
-            };
-
-            let arr = arr_start.cast::<MaybeUninit<GaihAddrTuple>>();
-            assert_eq!(
-                arr as usize % core::mem::align_of::<GaihAddrTuple>(),
-                0,
-                "arr_start is aligned"
-            );
-            assert!(
-                name_len + arr_len * core::mem::size_of::<GaihAddrTuple>() <= buf_len,
-                "name and array fit in the buffer allocation"
-            );
-
-            unsafe {
-                // Safety verified by assertions above.
-                core::slice::from_raw_parts_mut(arr, arr_len)
-            }
-        };
-
-        Ok(Self {
-            hostname,
-            addrs,
-            addrs_len: 0,
-            maybe_head,
-            set_head: false,
-        })
-    }
-
-    /// Attempts to add an address to the
-    pub fn push(&mut self, addr: Addr) -> bool {
-        if *self.maybe_head != core::ptr::null_mut() && !self.set_head {
-            unsafe {
-                // We're trusting that any non-null pointer at maybe_head is
-                // okay writing to. This unsafeness is declared in `try_new`, so
-                // we can just assume soundness here.
-                **self.maybe_head = GaihAddrTuple::new_addr(self.hostname, addr);
-            }
-            // No parent node to update.
-            self.set_head = true;
-            return true;
-        }
-
-        let child = {
-            let Some(slot) = self.addrs.get_mut(self.addrs_len) else {
-                return false;
-            };
-            core::ptr::from_mut(slot.write(GaihAddrTuple::new_addr(self.hostname, addr)))
-        };
-
-        let prev_len = self.addrs_len;
-        self.addrs_len += 1;
-
-        match prev_len {
-            0 if !self.set_head => {}
-            0 if self.set_head => unsafe {
-                // set_head is only true if we've already written to this pointer. In that
-                // case we might as well assume it's a good pointer a second time.
-                (**self.maybe_head).next = child;
-            },
-            nonzero => {
-                let parent = &mut self.addrs[nonzero - 1];
-                unsafe {
-                    // We should only be at a nonzero index if we've already
-                    // written to the parent.
-                    parent.assume_init_mut().next = child;
-                }
-            }
-        }
-
-        true
-    }
-}
-
-/*
-scratch
-
-oh my: https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/nscd/aicache.c#L139-L150
-
-enum nss_status _nss_mdns_gethostbyname4_r(const char* name,
-                                           struct gaih_addrtuple** pat,
-                                           char* buffer, size_t buflen,
-                                           int* errnop, int* h_errnop,
-                                           int32_t* ttlp) {
-
-enum nss_status _nss_mdns_gethostbyname4_r(const char*, struct gaih_addrtuple**,
-                                           char*, size_t, int*, int*, int32_t*);
-
-            #[no_mangle]
-            unsafe extern "C" fn [<_nss_ $mod_ident _gethostbyname2_r>](
-                name: *const libc::c_char,
-                family: libc::c_int,
-                result: *mut CHost,
-                buf: *mut libc::c_char,
-                buflen: libc::size_t,
-                errnop: *mut libc::c_int,
-                h_errnop: *mut libc::c_int
-            ) -> libc::c_int {
-
-*/
