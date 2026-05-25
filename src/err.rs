@@ -9,7 +9,7 @@ pub struct NssErr {
     /// A standard libc error.
     c_err: i32,
     nss: NssStatus,
-    dns: DnsStatus,
+    dns: HostStatus,
 }
 
 impl NssErr {
@@ -17,15 +17,14 @@ impl NssErr {
     pub const SUCCESS: Self = Self {
         c_err: 0,
         nss: NssStatus::Success,
-        dns: DnsStatus::Success,
+        dns: HostStatus::Success,
     };
 
-    /// This can be returned when the plugin successfully ran and found
-    /// no matches for the hostname.
+    /// The plugin completed successfully and found no matches for the hostname.
     pub const NO_RESULT: Self = Self {
         c_err: 0,
         nss: NssStatus::NotFound,
-        dns: DnsStatus::NoData,
+        dns: HostStatus::NoData,
     };
 
     /// For example, a hostname is not valid UTF-8, which is expected
@@ -33,7 +32,7 @@ impl NssErr {
     pub const INVALID_INPUT: Self = Self {
         c_err: libc::EINVAL,
         nss: NssStatus::Unavailable,
-        dns: DnsStatus::NoRecovery,
+        dns: HostStatus::NoRecovery,
     };
 
     /// This is a suitable return type for total plugin failure. For example,
@@ -44,7 +43,7 @@ impl NssErr {
         // with something more appropriate for your context.
         c_err: libc::EIO,
         nss: NssStatus::Unavailable,
-        dns: DnsStatus::NoRecovery,
+        dns: HostStatus::NoRecovery,
     };
 
     /// The buffer containing requests results was too small. Retrying
@@ -52,7 +51,7 @@ impl NssErr {
     pub(crate) const BUF_TOO_SMALL: Self = Self {
         c_err: libc::EAGAIN,
         nss: NssStatus::TryAgain,
-        dns: DnsStatus::TryAgain,
+        dns: HostStatus::TryAgain,
     };
 
     /// Writes error state to return pointers and yields the appropriate
@@ -78,7 +77,7 @@ pub enum NssStatus {
     Unavailable,
 
     /// The query completed successfully without returning any matching hosts.
-    /// Pairs with [`DnsStatus::HostNotFound`].
+    /// Pairs with [`HostStatus::HostNotFound`].
     NotFound,
 
     /// Request succeeded. Caller should check PAT list.
@@ -89,11 +88,13 @@ pub enum NssStatus {
     // Return,
 }
 
-/// The DNS explanation for an NSS return code.
+/// The NSS Host lookup errno. Further explains the
+/// standard C errno.
+///
 /// Defined here. Comments copied verbatim.
 ///
 /// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/resolv/netdb.h#L62-L75>
-pub enum DnsStatus {
+pub enum HostStatus {
     /// See errno.
     Internal = -1,
 

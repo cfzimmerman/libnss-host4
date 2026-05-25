@@ -1,9 +1,10 @@
-use core::{ffi::CStr, mem::MaybeUninit};
+use core::ffi::CStr;
+use core::mem::MaybeUninit;
 
-use crate::{
-    Addr, GaihAddrTuple,
-    err::{NssErr, NssRes},
-};
+use crate::Addr;
+use crate::GaihAddrTuple;
+use crate::err::NssErr;
+use crate::err::NssRes;
 
 /// This is the buffer into which gethostbyname4_r results are accumulated.
 ///
@@ -33,12 +34,11 @@ impl<'a> Gaih4Buf<'a> {
     //
     // Steps:
     // - Writes the hostname string into the front of the buffer.
-    //   every entry in the buffer will reference that hostname
+    //   Every entry in the buffer will reference that hostname
     //   pointer.
     // - Defines an aligned section of the buffer after the hostname
     //   into which addr results are written.
-    // - Returns that as a special buffer into which results can be
-    //   accumulated.
+    // - Returns that as an abstraction into which results can be accumulated.
     pub(crate) unsafe fn try_new(
         hostname: &CStr,
         maybe_head: &'a mut *mut GaihAddrTuple,
@@ -115,9 +115,13 @@ impl<'a> Gaih4Buf<'a> {
         })
     }
 
-    /// Attempts to add an address to the
+    /// Attempts to add an address to the buffer.
+    ///
+    /// Returns true on success and false on failure. After the first
+    /// false, a push will never succeed until the NSS caller tries again
+    /// with a larger buffer.
     pub(crate) fn push(&mut self, addr: Addr) -> bool {
-        if *self.maybe_head != core::ptr::null_mut() && !self.set_head {
+        if !(*self.maybe_head).is_null() && !self.set_head {
             unsafe {
                 // We're trusting that any non-null pointer at maybe_head is
                 // okay writing to. This unsafeness is declared in `try_new`, so
@@ -141,7 +145,7 @@ impl<'a> Gaih4Buf<'a> {
             0 => unreachable!("addrs_len is incremented above"),
             1 if !self.set_head => {
                 assert!(
-                    *self.maybe_head == core::ptr::null_mut(),
+                    (*self.maybe_head).is_null(),
                     "if PAT were non null, we would have written to it and returned early"
                 );
                 // Point PAT at the first node in the return buffer.

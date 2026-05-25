@@ -3,25 +3,65 @@
 mod buf;
 pub mod err;
 
-use core::{
-    ffi::CStr,
-    net::{Ipv4Addr, Ipv6Addr},
-};
+use core::ffi::CStr;
+use core::net::Ipv4Addr;
+use core::net::Ipv6Addr;
 
-use crate::{
-    buf::Gaih4Buf,
-    err::{NssErr, NssStatus},
-};
+use crate::buf::Gaih4Buf;
+use crate::err::NssErr;
+use crate::err::NssStatus;
 
-/// An address that can be returned from gethostbyname4_r.
-pub enum Addr {
-    V4(Ipv4Addr),
-    V6 {
-        ip: Ipv6Addr,
-
-        /// Zero is a safe default if you don't know what to put here.
-        scope_id: u32,
-    },
+/// This macro expands into an NSS-compatible hook for the `gethostbyname4_r`
+/// hostname resolution API.
+///
+/// # !!! Safety !!!
+///
+/// `nss_name` must be unique across any other invocations of this macro
+/// in your crate.
+///
+/// # Example
+///
+/// ```
+/// use core::net::Ipv6Addr;
+/// use libnss_host4::{Addr, HostResolver, err::NssErr};
+///
+/// /// A DNS resolver that maps "localhost" to [::1%0].
+/// struct LocalDns;
+///
+/// impl HostResolver for LocalDns {
+///     fn resolve_host(
+///         hostname: &str,
+///     ) -> Result<impl Iterator<Item = crate::Addr>, crate::err::NssErr> {
+///         if hostname == "localhost" {
+///             return Ok(core::iter::once(Addr::V6 {
+///                 ip: Ipv6Addr::LOCALHOST,
+///                 scope_id: 0,
+///             }));
+///         }
+///         Err(NssErr::NO_RESULT)
+///     }
+/// }
+///
+/// impl_gethostbyname4_r!(local, LocalDns);
+/// ```
+#[macro_export]
+macro_rules! impl_gethostbyname4_r {
+    ($nss_name:ident, $resolver:ident) => {
+        paste::paste! {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn [<_nss_ $nss_name _gethostbyname4_r>](
+                name: *const ::libc::c_char,
+                pat: *mut *mut $crate::GaihAddrTuple,
+                buffer: *mut ::libc::c_char,
+                buflen: ::libc::size_t,
+                errnop: *mut ::libc::c_int,
+                h_errnop: *mut ::libc::c_int,
+                ttlp: *mut ::libc::c_int,
+            ) -> ::libc::c_int {
+                unsafe { $crate::gethostbyname4_r::<$resolver>(name, pat, buffer, buflen, errnop, h_errnop, ttlp) }
+            }
+        }
+    };
 }
 
 /// GETHOSTBYNAME4_R
@@ -36,17 +76,32 @@ pub enum Addr {
 /// effort is based largely on avahi nss-mdns source. My own understanding of
 /// this API is documented here in-excess with the hope that anything incorrect
 /// can be swiftly identified and fixed. If it is somehow fully correct, then
-/// it may also be a useful reference for others exploring this API.
+/// it may also be a useful reference for others implementing NSS hooks.
+///
+/// # Safety
+///
+/// This function should never be called outside the NSS lookup path.
+/// Within glibc NSS, this implementation expects the following:
+///
+/// - `name` is a valid C string.
+/// - `*pat` is always a valid pointer. `**pat` may be either NULL or a valid
+///   `GaihAddrTuple` into which the first NSS result is written. The caller
+///   will only explore this list if it receives a success return value.
+/// - `buffer` + `buflen` are equivalent to a `&mut [u8]` with all the implications
+///   byte slices carry in safe rust.
+/// - `errnop` and `h_errnop` are safe to dereference.
+/// - `ttlp` is either NULL or safe to dereference.
 ///
 /// # Returns
 ///
 /// Return value is an enum defined here:
 ///
 /// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/nss/nss.h#L30-L38>
-pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
+#[inline]
+pub unsafe fn gethostbyname4_r<R: HostResolver>(
     // The hostname to be resolved. This is a null-terminated C-string and
     // must not be used in the returned gaih_addrtuple. The gaih_addrtuple
-    // name should be stored within the given buffer:
+    // name should be stored within the given return buffer:
     //
     // https://github.com/avahi/nss-mdns/blob/3292b172ce0100a1aed8b67c381760bc3fb87f2e/src/util.c#L234-L236
     name: *const libc::c_char,
@@ -70,7 +125,7 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
     // A canonical linux error code.
     errnop: *mut libc::c_int,
 
-    // DNS error among those enumerated here:
+    // "Host" lookup errno. Extends the standard errno.
     // https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/resolv/netdb.h#L62-L69
     h_errnop: *mut libc::c_int,
 
@@ -85,11 +140,7 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
     // https://github.com/avahi/nss-mdns/blob/3292b172ce0100a1aed8b67c381760bc3fb87f2e/src/nss.c#L164
     ttlp: *mut libc::c_int,
 ) -> libc::c_int {
-    if name == core::ptr::null()
-        || pat == core::ptr::null_mut()
-        || buffer == core::ptr::null_mut()
-        || errnop == core::ptr::null_mut()
-        || h_errnop == core::ptr::null_mut()
+    if name.is_null() || pat.is_null() || buffer.is_null() || errnop.is_null() || h_errnop.is_null()
     // Allow null ttlp
     {
         return NssStatus::Unavailable as i32;
@@ -119,7 +170,7 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
         return NssErr::INVALID_INPUT.bail(errnop, h_errnop);
     };
 
-    let addrs = match ToDo::resolve_host(hostname) {
+    let addrs = match R::resolve_host(hostname) {
         Ok(res) => res,
         Err(e) => return e.bail(errnop, h_errnop),
     };
@@ -132,11 +183,11 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
         }
     }
 
-    if ttlp != core::ptr::null_mut() {
-        if let Some(user_ttlp) = ToDo::set_ttlp(hostname) {
-            unsafe {
-                *ttlp = user_ttlp;
-            }
+    if !ttlp.is_null()
+        && let Some(user_ttlp) = R::set_ttlp(hostname)
+    {
+        unsafe {
+            *ttlp = user_ttlp;
         }
     }
 
@@ -146,28 +197,44 @@ pub unsafe extern "C" fn _nss_todo_gethostbyname4_r(
     NssErr::SUCCESS.bail(errnop, h_errnop)
 }
 
-pub trait GetAddrInfo {
-    /// Resolves the
+/// An address that can be returned from gethostbyname4_r.
+//
+// Not using `SocketAddr` because port would be misleading.
+pub enum Addr {
+    V4(Ipv4Addr),
+    V6 {
+        ip: Ipv6Addr,
+
+        /// Zero is a safe default if you don't know what to put here.
+        scope_id: u32,
+    },
+}
+
+/// Implement this trait with the actual address business logic
+/// that `gethostbyname4_r` should expose. The C interop layer
+/// simply wraps the resolution defined here.
+pub trait HostResolver {
+    /// Returns zero or more host addresses matching the hostname query
+    /// or an NSS-contextualized error on failure.
     fn resolve_host(hostname: &str) -> Result<impl Iterator<Item = Addr>, NssErr>;
 
+    /// Optionally sets the "Time to Live Pointer" for the given
+    /// hostname's NSS query. This field determines cache lifespan
+    /// for DNS entries.
+    ///
+    /// Returning None will skip writing to this pointer entirely.
+    ///
+    /// This function is only invoked if the caller's TTLP is not null.
     fn set_ttlp(hostname: &str) -> Option<i32> {
         let _ = hostname;
         None
     }
 }
 
-struct ToDo;
-
-impl GetAddrInfo for ToDo {
-    fn resolve_host(_hostname: &str) -> Result<impl Iterator<Item = Addr>, NssErr> {
-        Ok(core::iter::empty())
-    }
-}
-
 /// Recursive host object returned from `gethostbyname4`.
 ///
 /// Defined in `nss.h`.
-/// https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/nss/nss.h#L42-L49
+/// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/nss/nss.h#L42-L49>
 #[repr(C)]
 #[derive(Debug)]
 pub struct GaihAddrTuple {
