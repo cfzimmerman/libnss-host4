@@ -5,6 +5,7 @@ pub type NssRes<T> = Result<T, NssErr>;
 ///
 /// Some common constants are defined, but feel free to
 /// construct your own as well.
+#[derive(Debug)]
 pub struct NssErr {
     /// A standard libc error.
     c_err: i32,
@@ -67,6 +68,7 @@ impl NssErr {
 ///
 /// Defined here:
 /// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/nss/nss.h#L30-L38>
+#[derive(Debug)]
 pub enum NssStatus {
     /// This service is temporarily unusable. For example, the given address
     /// buffer is too small or the backing DNS service is overloaded.
@@ -94,6 +96,7 @@ pub enum NssStatus {
 /// Defined here. Comments copied verbatim.
 ///
 /// <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/resolv/netdb.h#L62-L75>
+#[derive(Debug)]
 pub enum HostStatus {
     /// See errno.
     Internal = -1,

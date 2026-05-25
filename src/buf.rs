@@ -45,7 +45,16 @@ impl<'a> Gaih4Buf<'a> {
         buffer: *mut libc::c_char,
         buf_len: libc::size_t,
     ) -> NssRes<Self> {
-        assert_ne!(buffer, core::ptr::null_mut(), "buffer is not null");
+        if buffer.is_null() {
+            return Err(NssErr::INVALID_INPUT);
+        }
+
+        if !(*maybe_head).is_null() {
+            unsafe {
+                // Assume safe to write if not NULL.
+                (**maybe_head).next = core::ptr::null_mut();
+            }
+        }
 
         let (hostname, name_len) = {
             let hostname = hostname.to_bytes_with_nul();
@@ -78,16 +87,11 @@ impl<'a> Gaih4Buf<'a> {
             // the buffer if resolution fails for some other reason.
             &mut []
         } else {
-            // Offset is a usize, so this only fails if isize::MAX < offset.
-            // That should never happen in reality, but this gives a more
-            // mathematically robust API.
-            let offset_bytes = isize::try_from(offset_bytes).unwrap_or(isize::MAX);
-
-            let arr_start = unsafe {
-                // This offset is guaranteed to point to allocated memory because
-                // offset and therefore arr_len are nonzero.
-                buffer.offset(offset_bytes)
-            };
+            let arr_start = buffer.wrapping_add(offset_bytes);
+            if (arr_start as usize) < buffer as usize {
+                // Pointer addition wrapped. Cannot continue.
+                return Err(NssErr::INVALID_INPUT);
+            }
 
             let arr = arr_start.cast::<MaybeUninit<GaihAddrTuple>>();
             assert_eq!(
@@ -168,5 +172,135 @@ impl<'a> Gaih4Buf<'a> {
         }
 
         true
+    }
+}
+
+/// Iterating list entries a la NSS caller is a useful
+/// feature when testing. However it's not needed for
+/// this crate to be useful, and it's yet another source
+/// of unsafe blocks. So the iterator is implemented
+/// here as cfg test.
+#[cfg(test)]
+mod buf_iter {
+    use core::{
+        ffi::CStr,
+        marker::PhantomData,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
+
+    use crate::{Addr, GaihAddrTuple, buf::Gaih4Buf};
+
+    // TODO: resume here by combing this impl and then using it in tests.
+
+    impl<'a> Gaih4Buf<'a> {
+        fn iter(&self) -> Gaih4BufIter<'_> {
+            let next = if !self.set_head {
+                assert_eq!(self.addrs_len, 0);
+                core::ptr::null_mut()
+            } else {
+                *self.maybe_head
+            };
+            Gaih4BufIter {
+                next,
+                _t: PhantomData,
+            }
+        }
+    }
+
+    struct Gaih4BufIter<'a> {
+        // Using raw pointers in a rust linked list is pretty lame.
+        // However the target list is stored entirely within a
+        // custom allocator, so the usual suspect rust primitives for
+        // fancier list construction are less attractive.
+        next: *mut GaihAddrTuple,
+        _t: PhantomData<&'a Gaih4Buf<'a>>,
+    }
+
+    impl<'a> Iterator for Gaih4BufIter<'a> {
+        type Item = (&'a str, Addr);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.next.is_null() {
+                return None;
+            }
+            let node = unsafe {
+                // Safety is a chain: first the inputs were well formed, and
+                // then the buffer's list is well formed. If both are the case,
+                // then this progresses to the next initialized node in the buffer.
+                &mut *self.next
+            };
+            self.next = node.next;
+            let name = unsafe {
+                // Each node's name should be the input hostname copied
+                // directly into the output buffer.
+                CStr::from_ptr(node.name)
+            };
+            let name = name.to_str().expect("CStr should be valid utf8");
+
+            let addr = match node.family {
+                libc::AF_INET => Addr::V4(Ipv4Addr::from_bits(node.addr[0])),
+                libc::AF_INET6 => {
+                    let mut bytes = node
+                        .addr
+                        .iter()
+                        .flat_map(|int| int.to_ne_bytes().into_iter());
+                    let bytes: [u8; 16] = core::array::from_fn(|_| {
+                        bytes
+                            .next()
+                            .expect("should be enough bytes for an IPv6 addr")
+                    });
+                    Addr::V6 {
+                        ip: Ipv6Addr::from_octets(bytes),
+                        scope_id: node.scope_id,
+                    }
+                }
+                other => panic!("valid nodes are only ever IPv4 or IPv6. Found libc::AF_{other}"),
+            };
+
+            Some((name, addr))
+        }
+    }
+}
+
+#[cfg(test)]
+mod buf_tests {
+    use crate::{Addr, GaihAddrTuple, buf::Gaih4Buf};
+    use core::{
+        ffi::CStr,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
+
+    #[test]
+    fn good_addrs_seed_pat() {
+        const ADDRS4: &[u32] = &[111, 222, 333];
+        const ADDRS6: &[u128] = &[777, 888, 999];
+
+        const HOSTNAME: &CStr = c"AMBIGUOUS_NEIGHBOR";
+        let mut pat = core::pin::pin!(GaihAddrTuple {
+            next: core::ptr::null_mut(),
+            name: core::ptr::null(),
+            family: libc::AF_UNSPEC,
+            addr: [0; 4],
+            scope_id: 0,
+        });
+        let mut pat_ptr = &raw mut *pat;
+        let mut bytes = core::pin::pin!([0i8; 512]);
+
+        let mut buf =
+            unsafe { Gaih4Buf::try_new(HOSTNAME, &mut pat_ptr, bytes.as_mut_ptr(), bytes.len()) }
+                .expect("well formed inputs should be successful");
+
+        for addr in ADDRS4.iter().copied().map(Ipv4Addr::from_bits) {
+            let success = buf.push(Addr::V4(addr));
+            assert!(success, "v4 push should succeed");
+        }
+
+        for (scope_id, ip) in ADDRS6.iter().copied().map(Ipv6Addr::from_bits).enumerate() {
+            let success = buf.push(Addr::V6 {
+                ip,
+                scope_id: scope_id as u32,
+            });
+            assert!(success, "v6 push should succeed");
+        }
     }
 }

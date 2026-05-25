@@ -11,6 +11,12 @@ use crate::buf::Gaih4Buf;
 use crate::err::NssErr;
 use crate::err::NssStatus;
 
+/*
+
+Test: this with NULL inputs. What else?
+
+*/
+
 /// This macro expands into an NSS-compatible hook for the `gethostbyname4_r`
 /// hostname resolution API.
 ///
