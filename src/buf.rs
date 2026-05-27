@@ -144,10 +144,8 @@ impl<'a> Gaih4Buf<'a> {
             core::ptr::from_mut(slot.write(GaihAddrTuple::new_addr(self.hostname, addr)))
         };
 
-        self.addrs_len += 1;
         match self.addrs_len {
-            0 => unreachable!("addrs_len is incremented above"),
-            1 if !self.set_head => {
+            0 if !self.set_head => {
                 assert!(
                     (*self.maybe_head).is_null(),
                     "if PAT were non null, we would have written to it and returned early"
@@ -156,9 +154,10 @@ impl<'a> Gaih4Buf<'a> {
                 *self.maybe_head = child;
                 self.set_head = true;
             }
-            1 => unsafe {
+            0 => unsafe {
+                // Point the seeded PAT to this child node.
                 // set_head is only true if we've already written to this pointer. In that
-                // case we might as well assume it's a good pointer a second time.
+                // case assume yet again that it's a good pointer.
                 (**self.maybe_head).next = child;
             },
             nonzero => {
@@ -170,30 +169,30 @@ impl<'a> Gaih4Buf<'a> {
                 }
             }
         }
+        self.addrs_len += 1;
 
         true
     }
 }
 
 /// Iterating list entries a la NSS caller is a useful
-/// feature when testing. However it's not needed for
-/// this crate to be useful, and it's yet another source
+/// feature when testing. However it's not needed by the
+/// consumer of this crate, and it's yet another source
 /// of unsafe blocks. So the iterator is implemented
 /// here as cfg test.
 #[cfg(test)]
 mod buf_iter {
-    use core::{
-        ffi::CStr,
-        marker::PhantomData,
-        net::{Ipv4Addr, Ipv6Addr},
-    };
+    use core::ffi::CStr;
+    use core::marker::PhantomData;
+    use core::net::Ipv4Addr;
+    use core::net::Ipv6Addr;
 
-    use crate::{Addr, GaihAddrTuple, buf::Gaih4Buf};
-
-    // TODO: resume here by combing this impl and then using it in tests.
+    use crate::Addr;
+    use crate::GaihAddrTuple;
+    use crate::buf::Gaih4Buf;
 
     impl<'a> Gaih4Buf<'a> {
-        fn iter(&self) -> Gaih4BufIter<'_> {
+        pub fn iter(&self) -> Gaih4BufIter<'_> {
             let next = if !self.set_head {
                 assert_eq!(self.addrs_len, 0);
                 core::ptr::null_mut()
@@ -207,7 +206,7 @@ mod buf_iter {
         }
     }
 
-    struct Gaih4BufIter<'a> {
+    pub struct Gaih4BufIter<'a> {
         // Using raw pointers in a rust linked list is pretty lame.
         // However the target list is stored entirely within a
         // custom allocator, so the usual suspect rust primitives for
@@ -217,7 +216,7 @@ mod buf_iter {
     }
 
     impl<'a> Iterator for Gaih4BufIter<'a> {
-        type Item = (&'a str, Addr);
+        type Item = (&'a CStr, Addr);
 
         fn next(&mut self) -> Option<Self::Item> {
             if self.next.is_null() {
@@ -235,22 +234,17 @@ mod buf_iter {
                 // directly into the output buffer.
                 CStr::from_ptr(node.name)
             };
-            let name = name.to_str().expect("CStr should be valid utf8");
 
             let addr = match node.family {
-                libc::AF_INET => Addr::V4(Ipv4Addr::from_bits(node.addr[0])),
+                libc::AF_INET => Addr::V4(Ipv4Addr::from(node.addr[0].to_ne_bytes())),
                 libc::AF_INET6 => {
-                    let mut bytes = node
-                        .addr
-                        .iter()
-                        .flat_map(|int| int.to_ne_bytes().into_iter());
-                    let bytes: [u8; 16] = core::array::from_fn(|_| {
-                        bytes
-                            .next()
-                            .expect("should be enough bytes for an IPv6 addr")
+                    let mut bytes = node.addr.iter().flat_map(|bits| bits.to_ne_bytes());
+                    let octets = core::array::from_fn(|_| {
+                        bytes.next().expect("there should be exactly 4 * 4 bytes")
                     });
+                    assert_eq!(bytes.next(), None);
                     Addr::V6 {
-                        ip: Ipv6Addr::from_octets(bytes),
+                        ip: Ipv6Addr::from(octets),
                         scope_id: node.scope_id,
                     }
                 }
@@ -264,18 +258,24 @@ mod buf_iter {
 
 #[cfg(test)]
 mod buf_tests {
-    use crate::{Addr, GaihAddrTuple, buf::Gaih4Buf};
-    use core::{
-        ffi::CStr,
-        net::{Ipv4Addr, Ipv6Addr},
-    };
+    use crate::Addr;
+    use crate::GaihAddrTuple;
+    use crate::buf::Gaih4Buf;
+    use crate::err::NssErr;
+    #[cfg(test)]
+    use crate::err::NssRes;
+    use core::ffi::CStr;
+    use core::net::Ipv4Addr;
+    use core::net::Ipv6Addr;
 
+    /// Pushes addresses into a well formed request with a large
+    /// buffer and a pre-seeded PAT. Ensures outputs match inputs.
     #[test]
-    fn good_addrs_seed_pat() {
+    fn large_buf_seed_pat() {
         const ADDRS4: &[u32] = &[111, 222, 333];
         const ADDRS6: &[u128] = &[777, 888, 999];
-
         const HOSTNAME: &CStr = c"AMBIGUOUS_NEIGHBOR";
+
         let mut pat = core::pin::pin!(GaihAddrTuple {
             next: core::ptr::null_mut(),
             name: core::ptr::null(),
@@ -290,17 +290,153 @@ mod buf_tests {
             unsafe { Gaih4Buf::try_new(HOSTNAME, &mut pat_ptr, bytes.as_mut_ptr(), bytes.len()) }
                 .expect("well formed inputs should be successful");
 
-        for addr in ADDRS4.iter().copied().map(Ipv4Addr::from_bits) {
+        self::push_and_check(HOSTNAME, &mut buf, true, ADDRS4, ADDRS6)
+            .expect("should pass with large buf and seeded PAT");
+    }
+
+    #[test]
+    fn large_buf_null_pat() {
+        const ADDRS4: &[u32] = &[!111, !222];
+        const ADDRS6: &[u128] = &[!777, !888, !999, !1010];
+        const HOSTNAME: &CStr = c"another_host";
+
+        let mut pat = core::ptr::null_mut();
+        let mut bytes = core::pin::pin!([0i8; 512]);
+
+        let mut buf =
+            unsafe { Gaih4Buf::try_new(HOSTNAME, &mut pat, bytes.as_mut_ptr(), bytes.len()) }
+                .expect("well formed inputs should be successful");
+
+        self::push_and_check(HOSTNAME, &mut buf, true, ADDRS4, ADDRS6)
+            .expect("should pass with large buf and null PAT");
+    }
+
+    #[test]
+    fn tiny_buf_seed_pat() {
+        const HOSTNAME: &CStr = c"RunningOutOfIdeas";
+        const ADDRS4: &[u32] = &[2130706433];
+        const ADDRS6: &[u128] = &[];
+
+        let mut pat = core::pin::pin!(GaihAddrTuple {
+            next: core::ptr::null_mut(),
+            name: core::ptr::null(),
+            family: libc::AF_UNSPEC,
+            addr: [0; 4],
+            scope_id: 0,
+        });
+        let mut pat_ptr = &raw mut *pat;
+        // Just enough to hold the name
+        let mut bytes = core::pin::pin!([0i8; 19]);
+
+        let mut buf =
+            unsafe { Gaih4Buf::try_new(HOSTNAME, &mut pat_ptr, bytes.as_mut_ptr(), bytes.len()) }
+                .expect("well formed inputs should be successful");
+
+        self::push_and_check(HOSTNAME, &mut buf, true, ADDRS4, ADDRS6)
+            .expect("should pass with large buf and seeded PAT");
+    }
+
+    // The test above but exactly one fewer byte in the buf.
+    #[test]
+    fn fail_tinier_buf_seed_pat() {
+        const HOSTNAME: &CStr = c"RunningOutOfIdeas2";
+
+        let mut pat = core::pin::pin!(GaihAddrTuple {
+            next: core::ptr::null_mut(),
+            name: core::ptr::null(),
+            family: libc::AF_UNSPEC,
+            addr: [0; 4],
+            scope_id: 0,
+        });
+        let mut pat_ptr = &raw mut *pat;
+        // Just enough to hold the name
+        let mut bytes = core::pin::pin!([0i8; 18]);
+
+        let buf =
+            unsafe { Gaih4Buf::try_new(HOSTNAME, &mut pat_ptr, bytes.as_mut_ptr(), bytes.len()) };
+        let Err(err) = buf else {
+            panic!("buf should be too small for the hostname");
+        };
+        assert_eq!(err, NssErr::BUF_TOO_SMALL);
+    }
+
+    // Buffer is too small for marginal results.
+    #[test]
+    fn fail_small_buf_null_pat() {
+        const ADDRS4: &[u32] = &[12345, 6789];
+        const ADDRS6: &[u128] = &[10111213, 1416171828, 9018937654];
+        const HOSTNAME: &CStr = c"should-fail-no-space";
+
+        let mut pat = core::ptr::null_mut();
+        let mut bytes = core::pin::pin!([0i8; 97]);
+
+        let mut buf =
+            unsafe { Gaih4Buf::try_new(HOSTNAME, &mut pat, bytes.as_mut_ptr(), bytes.len()) }
+                .expect("well formed inputs should be successful");
+
+        let err = self::push_and_check(HOSTNAME, &mut buf, false, ADDRS4, ADDRS6)
+            .expect_err("buf is not large enough for all results");
+        assert_eq!(err, NssErr::BUF_TOO_SMALL);
+    }
+
+    /// Pushes addresses into the buffer and ensures outputs match.
+    fn push_and_check(
+        hostname: &CStr,
+        buf: &mut Gaih4Buf,
+        expect_success: bool,
+        v4: &[u32],
+        v6: &[u128],
+    ) -> NssRes<()> {
+        for addr in v4.iter().copied().map(Ipv4Addr::from_bits) {
             let success = buf.push(Addr::V4(addr));
-            assert!(success, "v4 push should succeed");
+            if expect_success {
+                assert!(success, "v4 push should succeed");
+            } else {
+                return Err(NssErr::BUF_TOO_SMALL);
+            }
         }
 
-        for (scope_id, ip) in ADDRS6.iter().copied().map(Ipv6Addr::from_bits).enumerate() {
+        for (scope_id, ip) in v6.iter().copied().map(Ipv6Addr::from_bits).enumerate() {
             let success = buf.push(Addr::V6 {
                 ip,
                 scope_id: scope_id as u32,
             });
-            assert!(success, "v6 push should succeed");
+
+            if expect_success {
+                assert!(success, "v6 push should succeed");
+            } else {
+                return Err(NssErr::BUF_TOO_SMALL);
+            }
         }
+
+        let mut buffered = buf.iter();
+        let mut count = 0;
+        for ((host, addr), expected) in (&mut buffered)
+            .zip(v4.iter().copied().map(Ipv4Addr::from_bits).map(Addr::V4))
+            .take(v4.len())
+        {
+            assert_eq!(host, hostname);
+            assert_eq!(addr, expected);
+            count += 1;
+        }
+
+        for ((host, addr), expected) in (&mut buffered).zip(v6.iter().copied().enumerate().map(
+            |(scope_id, bits)| Addr::V6 {
+                ip: Ipv6Addr::from_bits(bits),
+                scope_id: scope_id as u32,
+            },
+        )) {
+            assert_eq!(host, hostname);
+            assert_eq!(addr, expected);
+            count += 1;
+        }
+
+        assert_eq!(
+            count,
+            v4.len() + v6.len(),
+            "should have buffered all addresses"
+        );
+
+        Ok(())
     }
 }

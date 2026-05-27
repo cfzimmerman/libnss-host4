@@ -30,6 +30,7 @@ Test: this with NULL inputs. What else?
 /// ```
 /// use core::net::Ipv6Addr;
 /// use libnss_host4::{Addr, HostResolver, err::NssErr};
+/// use libnss_host4::impl_gethostbyname4_r;
 ///
 /// /// A DNS resolver that maps "localhost" to [::1%0].
 /// struct LocalDns;
@@ -37,7 +38,7 @@ Test: this with NULL inputs. What else?
 /// impl HostResolver for LocalDns {
 ///     fn resolve_host(
 ///         hostname: &str,
-///     ) -> Result<impl Iterator<Item = crate::Addr>, crate::err::NssErr> {
+///     ) -> Result<impl Iterator<Item = Addr>, NssErr> {
 ///         if hostname == "localhost" {
 ///             return Ok(core::iter::once(Addr::V6 {
 ///                 ip: Ipv6Addr::LOCALHOST,
@@ -206,6 +207,7 @@ pub unsafe fn gethostbyname4_r<R: HostResolver>(
 /// An address that can be returned from gethostbyname4_r.
 //
 // Not using `SocketAddr` because port would be misleading.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Addr {
     V4(Ipv4Addr),
     V6 {
@@ -247,7 +249,16 @@ pub struct GaihAddrTuple {
     next: *mut GaihAddrTuple,
     name: *const libc::c_char,
     family: libc::c_int,
+
+    /// By precedent, the address is presumably stored in network byte order / big endian.
+    ///
+    /// <https://www.man7.org/linux/man-pages/man3/gethostbyname.3.html#:~:text=address%20in%20bytes.-,h_addr_list,-An%20array%20of>
     addr: [libc::c_uint; 4],
+
+    /// By the same body of precedent, this is presumably stored in
+    /// native byte order.
+    ///
+    /// <https://sourceware.org/glibc/manual/2.41/html_node/Internet-Address-Formats.html#:~:text=The%20scope%20ID%20is%20stored%20in%20host%20byte%20order>
     scope_id: libc::c_uint,
 }
 
@@ -274,7 +285,6 @@ impl GaihAddrTuple {
     fn new_v4(hostname: *const libc::c_char, ipv4: Ipv4Addr) -> Self {
         // This and `new_v6` are informed by avahi's use of inet_pton.
         // https://github.com/avahi/nss-mdns/blob/3292b172ce0100a1aed8b67c381760bc3fb87f2e/src/avahi.c#L108
-
         let mut pat = Self::new(hostname);
         pat.family = libc::AF_INET;
         pat.addr[0] = u32::from_ne_bytes(ipv4.octets());
@@ -287,17 +297,44 @@ impl GaihAddrTuple {
         pat.family = libc::AF_INET6;
         pat.scope_id = scope_id;
 
-        let addr = ipv6.octets();
-        let segs = addr.chunks_exact(4).map(|bytes| {
-            let arr: &[u8; 4] = bytes
-                .try_into()
-                .expect("IPv6 address contains four groups of four bytes");
-            u32::from_ne_bytes(*arr)
-        });
-        for (src, dst) in segs.zip(&mut pat.addr) {
-            *dst = src;
-        }
+        ipv6.octets()
+            .chunks_exact(4)
+            .map(|bits| <[_; 4]>::try_from(bits).expect("exact chunk size is four"))
+            .map(u32::from_ne_bytes)
+            .zip(&mut pat.addr)
+            .for_each(|(val, slot)| *slot = val);
 
         pat
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use core::net::Ipv4Addr;
+    use core::net::Ipv6Addr;
+
+    use crate::GaihAddrTuple;
+
+    /// NSS expects `gaih_addrtuple.addr` to hold the address in
+    /// big endian order. This test verifies with a direct conversion.
+    #[test]
+    fn ipv4_addr_is_network_byte_order() {
+        let t = GaihAddrTuple::new_v4(core::ptr::null(), Ipv4Addr::LOCALHOST);
+        let bytes: [u8; 16] = unsafe {
+            // Four u32s gives 16 bytes.
+            core::mem::transmute(t.addr)
+        };
+        assert_eq!(bytes[..4], Ipv4Addr::LOCALHOST.octets());
+    }
+
+    // IPv6 equivalent of the test above
+    #[test]
+    fn ipv6_addr_is_network_byte_order() {
+        let t = GaihAddrTuple::new_v6(core::ptr::null(), Ipv6Addr::LOCALHOST, 0);
+        let bytes: [u8; 16] = unsafe {
+            // Four u32s gives 16 bytes.
+            core::mem::transmute(t.addr)
+        };
+        assert_eq!(bytes, Ipv6Addr::LOCALHOST.octets());
     }
 }
