@@ -11,10 +11,15 @@ use crate::buf::Gaih4Buf;
 use crate::err::NssErr;
 use crate::err::NssStatus;
 
+#[doc(hidden)]
+pub mod _macro_internal {
+    pub use paste;
+}
+
 /// This macro expands into an NSS-compatible hook for the `gethostbyname4_r`
 /// hostname resolution API.
 ///
-/// # !!! Safety !!!
+/// # Safety
 ///
 /// `nss_name` must be unique across any other invocations of this macro
 /// in your crate.
@@ -33,7 +38,7 @@ use crate::err::NssStatus;
 /// impl HostResolver for LocalDns {
 ///     fn resolve_host(
 ///         hostname: &str,
-///     ) -> Result<impl Iterator<Item = Addr>, NssErr> {
+///     ) -> Result<impl IntoIterator<Item = Addr>, NssErr> {
 ///         if hostname == "localhost" {
 ///             return Ok(core::iter::once(Addr::V6 {
 ///                 ip: Ipv6Addr::LOCALHOST,
@@ -47,7 +52,7 @@ use crate::err::NssStatus;
 #[macro_export]
 macro_rules! impl_gethostbyname4_r {
     ($nss_name:ident, $resolver:ident) => {
-        paste::paste! {
+        $crate::_macro_internal::paste::paste! {
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn [<_nss_ $nss_name _gethostbyname4_r>](
                 name: *const ::libc::c_char,
@@ -183,6 +188,10 @@ pub unsafe fn gethostbyname4_r<R: HostResolver>(
         }
     }
 
+    if count == 0 {
+        return NssErr::NO_RESULT.bail(errnop, h_errnop);
+    }
+
     if !ttlp.is_null()
         && let Some(user_ttlp) = R::set_ttlp(hostname)
     {
@@ -191,9 +200,6 @@ pub unsafe fn gethostbyname4_r<R: HostResolver>(
         }
     }
 
-    if count == 0 {
-        return NssErr::NO_RESULT.bail(errnop, h_errnop);
-    }
     NssErr::SUCCESS.bail(errnop, h_errnop)
 }
 

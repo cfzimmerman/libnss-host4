@@ -49,13 +49,6 @@ impl<'a> Gaih4Buf<'a> {
             return Err(NssErr::INVALID_INPUT);
         }
 
-        if !(*maybe_head).is_null() {
-            unsafe {
-                // Assume safe to write if not NULL.
-                (**maybe_head).next = core::ptr::null_mut();
-            }
-        }
-
         let (hostname, name_len) = {
             let hostname = hostname.to_bytes_with_nul();
             let host_len = hostname.len();
@@ -94,18 +87,19 @@ impl<'a> Gaih4Buf<'a> {
             }
 
             let arr = arr_start.cast::<MaybeUninit<GaihAddrTuple>>();
-            assert_eq!(
+            debug_assert_eq!(
                 arr as usize % core::mem::align_of::<GaihAddrTuple>(),
                 0,
                 "arr_start is aligned"
             );
-            assert!(
-                name_len + arr_len * core::mem::size_of::<GaihAddrTuple>() <= buf_len,
+            debug_assert!(
+                offset_bytes + arr_len * core::mem::size_of::<GaihAddrTuple>() <= buf_len,
                 "name and array fit in the buffer allocation"
             );
 
             unsafe {
-                // Safety verified by assertions above.
+                // Alignment is ensured by `next_multiple_of(align_of)`.
+                // arr_len is floor division of buffer capacity into slots.
                 core::slice::from_raw_parts_mut(arr, arr_len)
             }
         };
@@ -124,6 +118,14 @@ impl<'a> Gaih4Buf<'a> {
     /// Returns true on success and false on failure. After the first
     /// false, a push will never succeed until the NSS caller tries again
     /// with a larger buffer.
+    //
+    // Invariant on list length:
+    // - Zero: set head is false, addrs len is 0, pat is unwritten.
+    // - One:
+    //   - Seeded pat: set head is true, addrs len is 0, pat is written.
+    //   - Unseeded pat: set head is true, addrs len is 1, pat is written.
+    // - Thereafter: the entire list can be traversed by following children\
+    //   from pat.
     pub(crate) fn push(&mut self, addr: Addr) -> bool {
         if !(*self.maybe_head).is_null() && !self.set_head {
             unsafe {
@@ -146,7 +148,7 @@ impl<'a> Gaih4Buf<'a> {
 
         match self.addrs_len {
             0 if !self.set_head => {
-                assert!(
+                debug_assert!(
                     (*self.maybe_head).is_null(),
                     "if PAT were non null, we would have written to it and returned early"
                 );
@@ -155,7 +157,7 @@ impl<'a> Gaih4Buf<'a> {
                 self.set_head = true;
             }
             0 => unsafe {
-                // Point the seeded PAT to this child node.
+                // Point the seeded to pat this child node.
                 // set_head is only true if we've already written to this pointer. In that
                 // case assume yet again that it's a good pointer.
                 (**self.maybe_head).next = child;
