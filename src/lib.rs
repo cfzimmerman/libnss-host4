@@ -11,12 +11,6 @@ use crate::buf::Gaih4Buf;
 use crate::err::NssErr;
 use crate::err::NssStatus;
 
-/*
-
-Test: this with NULL inputs. What else?
-
-*/
-
 /// This macro expands into an NSS-compatible hook for the `gethostbyname4_r`
 /// hostname resolution API.
 ///
@@ -34,6 +28,7 @@ Test: this with NULL inputs. What else?
 ///
 /// /// A DNS resolver that maps "localhost" to [::1%0].
 /// struct LocalDns;
+/// impl_gethostbyname4_r!(local, LocalDns);
 ///
 /// impl HostResolver for LocalDns {
 ///     fn resolve_host(
@@ -48,8 +43,6 @@ Test: this with NULL inputs. What else?
 ///         Err(NssErr::NO_RESULT)
 ///     }
 /// }
-///
-/// impl_gethostbyname4_r!(local, LocalDns);
 /// ```
 #[macro_export]
 macro_rules! impl_gethostbyname4_r {
@@ -224,7 +217,7 @@ pub enum Addr {
 pub trait HostResolver {
     /// Returns zero or more host addresses matching the hostname query
     /// or an NSS-contextualized error on failure.
-    fn resolve_host(hostname: &str) -> Result<impl Iterator<Item = Addr>, NssErr>;
+    fn resolve_host(hostname: &str) -> Result<impl IntoIterator<Item = Addr>, NssErr>;
 
     /// Optionally sets the "Time to Live Pointer" for the given
     /// hostname's NSS query. This field determines cache lifespan

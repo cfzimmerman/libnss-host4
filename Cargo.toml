@@ -3,6 +3,14 @@ name = "libnss-host4"
 version = "0.1.0"
 edition = "2024"
 
+# To test with sanitizers
+# RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --lib
+
 [dependencies]
 libc = "0.2.186"
 paste = "1.0.15"
+
+[[example]]
+name = "nss_example"
+crate-type = ["cdylib"]
+path = "examples/nss_example.rs"

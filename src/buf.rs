@@ -222,30 +222,37 @@ mod buf_iter {
             if self.next.is_null() {
                 return None;
             }
-            let node = unsafe {
+
+            let name;
+            let family;
+            let addr;
+            let scope_id;
+            unsafe {
                 // Safety is a chain: first the inputs were well formed, and
                 // then the buffer's list is well formed. If both are the case,
-                // then this progresses to the next initialized node in the buffer.
-                &mut *self.next
-            };
-            self.next = node.next;
-            let name = unsafe {
-                // Each node's name should be the input hostname copied
-                // directly into the output buffer.
-                CStr::from_ptr(node.name)
+                // then the next nonnull node in the buffer is initialized.
+                //
+                // These fields are already pointed to by a parent node, so making
+                // a reference to the node would break aliasing rules. Ergo the
+                // weird variable initialization.
+                name = CStr::from_ptr((*self.next).name);
+                family = (*self.next).family;
+                addr = (*self.next).addr;
+                scope_id = (*self.next).scope_id;
+                self.next = (*self.next).next;
             };
 
-            let addr = match node.family {
-                libc::AF_INET => Addr::V4(Ipv4Addr::from(node.addr[0].to_ne_bytes())),
+            let addr = match family {
+                libc::AF_INET => Addr::V4(Ipv4Addr::from(addr[0].to_ne_bytes())),
                 libc::AF_INET6 => {
-                    let mut bytes = node.addr.iter().flat_map(|bits| bits.to_ne_bytes());
+                    let mut bytes = addr.iter().flat_map(|bits| bits.to_ne_bytes());
                     let octets = core::array::from_fn(|_| {
                         bytes.next().expect("there should be exactly 4 * 4 bytes")
                     });
                     assert_eq!(bytes.next(), None);
                     Addr::V6 {
                         ip: Ipv6Addr::from(octets),
-                        scope_id: node.scope_id,
+                        scope_id,
                     }
                 }
                 other => panic!("valid nodes are only ever IPv4 or IPv6. Found libc::AF_{other}"),
