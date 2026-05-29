@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A convenient way to implement the glibc gethostbyname4_r NSS host API"
-readme = "../README.md"
+readme = "./README.md"
 
 # To test with sanitizers
 # RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --lib
