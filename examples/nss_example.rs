@@ -21,8 +21,8 @@ impl_gethostbyname4_r!(example, ExampleResolver);
 impl HostResolver for ExampleResolver {
     fn resolve_host(hostname: &str) -> Result<impl IntoIterator<Item = Addr>, NssErr> {
         if hostname.eq_ignore_ascii_case("example") {
-            Ok([Addr::V6 {
-                ip: Ipv6Addr::LOCALHOST,
+            Ok([Addr {
+                ip: Ipv6Addr::LOCALHOST.into(),
                 scope_id: 0,
             }])
         } else {

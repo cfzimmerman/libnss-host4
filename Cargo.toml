@@ -1,13 +1,15 @@
 [package]
 name = "libnss-host4"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "A convenient way to implement the glibc gethostbyname4_r NSS host API"
 readme = "./README.md"
-
-# To test with sanitizers
-# RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --lib
+repository = "https://github.com/cfzimmerman/libnss-host4"
+homepage = "https://github.com/cfzimmerman/libnss-host4"
+keywords = ["nss", "glibc", "dns", "hostname", "getaddrinfo"]
+categories = ["network-programming", "external-ffi-bindings", "os::unix-apis"]
 
 [dependencies]
 libc = "0.2.186"

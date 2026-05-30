@@ -24,7 +24,7 @@ impl<'a> Gaih4Buf<'a> {
     /// Constructs a new buffer for accumulating address results.
     ///
     /// Safety:
-    /// - hostname should point exactly to the cstring that was given
+    /// - hostname should point exactly to the c string that was given
     ///   to gethostbyname4_r.
     /// - buffer should be exactly the buffer provided to gethostbyname4_r.
     /// - maybe_head should be exactly the `pat` provided to gethostbyname4_r.
@@ -34,11 +34,10 @@ impl<'a> Gaih4Buf<'a> {
     //
     // Steps:
     // - Writes the hostname string into the front of the buffer.
-    //   Every entry in the buffer will reference that hostname
-    //   pointer.
+    //   Every entry in the buffer will reference that hostname pointer.
     // - Defines an aligned section of the buffer after the hostname
     //   into which addr results are written.
-    // - Returns that as an abstraction into which results can be accumulated.
+    // - Returns that as a struct into which results can be accumulated.
     pub(crate) unsafe fn try_new(
         hostname: &CStr,
         maybe_head: &'a mut *mut GaihAddrTuple,
@@ -124,14 +123,14 @@ impl<'a> Gaih4Buf<'a> {
     // - One:
     //   - Seeded pat: set head is true, addrs len is 0, pat is written.
     //   - Unseeded pat: set head is true, addrs len is 1, pat is written.
-    // - Thereafter: the entire list can be traversed by following children\
+    // - Thereafter: the entire list can be traversed by following children
     //   from pat.
     pub(crate) fn push(&mut self, addr: Addr) -> bool {
         if !(*self.maybe_head).is_null() && !self.set_head {
             unsafe {
                 // We're trusting that any non-null pointer at maybe_head is
                 // okay writing to. This unsafeness is declared in `try_new`, so
-                // we can just assume soundness here.
+                // assume soundness here.
                 **self.maybe_head = GaihAddrTuple::new_addr(self.hostname, addr);
             }
             // No parent node to update.
@@ -150,14 +149,14 @@ impl<'a> Gaih4Buf<'a> {
             0 if !self.set_head => {
                 debug_assert!(
                     (*self.maybe_head).is_null(),
-                    "if PAT were non null, we would have written to it and returned early"
+                    "if pat were non null, we would have written to it and returned early"
                 );
                 // Point PAT at the first node in the return buffer.
                 *self.maybe_head = child;
                 self.set_head = true;
             }
             0 => unsafe {
-                // Point the seeded to pat this child node.
+                // Point the seeded pat to this child node.
                 // set_head is only true if we've already written to this pointer. In that
                 // case assume yet again that it's a good pointer.
                 (**self.maybe_head).next = child;
@@ -235,8 +234,8 @@ mod buf_iter {
                 // then the next nonnull node in the buffer is initialized.
                 //
                 // These fields are already pointed to by a parent node, so making
-                // a reference to the node would break aliasing rules. Ergo the
-                // weird variable initialization.
+                // a mut ref to the node would be gross. Ergo the quirky variable
+                // initialization.
                 name = CStr::from_ptr((*self.next).name);
                 family = (*self.next).family;
                 addr = (*self.next).addr;
@@ -245,15 +244,18 @@ mod buf_iter {
             };
 
             let addr = match family {
-                libc::AF_INET => Addr::V4(Ipv4Addr::from(addr[0].to_ne_bytes())),
+                libc::AF_INET => Addr {
+                    ip: Ipv4Addr::from(addr[0].to_ne_bytes()).into(),
+                    scope_id,
+                },
                 libc::AF_INET6 => {
                     let mut bytes = addr.iter().flat_map(|bits| bits.to_ne_bytes());
                     let octets = core::array::from_fn(|_| {
                         bytes.next().expect("there should be exactly 4 * 4 bytes")
                     });
                     assert_eq!(bytes.next(), None);
-                    Addr::V6 {
-                        ip: Ipv6Addr::from(octets),
+                    Addr {
+                        ip: Ipv6Addr::from(octets).into(),
                         scope_id,
                     }
                 }
@@ -271,7 +273,6 @@ mod buf_tests {
     use crate::GaihAddrTuple;
     use crate::buf::Gaih4Buf;
     use crate::err::NssErr;
-    #[cfg(test)]
     use crate::err::NssRes;
     use core::ffi::CStr;
     use core::net::Ipv4Addr;
@@ -369,7 +370,7 @@ mod buf_tests {
         assert_eq!(err, NssErr::BUF_TOO_SMALL);
     }
 
-    // Buffer is too small for marginal results.
+    /// Buffer is too small for marginal results.
     #[test]
     fn fail_small_buf_null_pat() {
         const ADDRS4: &[u32] = &[12345, 6789];
@@ -396,8 +397,11 @@ mod buf_tests {
         v4: &[u32],
         v6: &[u128],
     ) -> NssRes<()> {
-        for addr in v4.iter().copied().map(Ipv4Addr::from_bits) {
-            let success = buf.push(Addr::V4(addr));
+        for ip in v4.iter().copied().map(Ipv4Addr::from_bits) {
+            let success = buf.push(Addr {
+                ip: ip.into(),
+                scope_id: 0,
+            });
             if expect_success {
                 assert!(success, "v4 push should succeed");
             } else {
@@ -406,8 +410,8 @@ mod buf_tests {
         }
 
         for (scope_id, ip) in v6.iter().copied().map(Ipv6Addr::from_bits).enumerate() {
-            let success = buf.push(Addr::V6 {
-                ip,
+            let success = buf.push(Addr {
+                ip: ip.into(),
                 scope_id: scope_id as u32,
             });
 
@@ -421,7 +425,10 @@ mod buf_tests {
         let mut buffered = buf.iter();
         let mut count = 0;
         for ((host, addr), expected) in (&mut buffered)
-            .zip(v4.iter().copied().map(Ipv4Addr::from_bits).map(Addr::V4))
+            .zip(v4.iter().copied().map(Ipv4Addr::from_bits).map(|ip| Addr {
+                ip: ip.into(),
+                scope_id: 0,
+            }))
             .take(v4.len())
         {
             assert_eq!(host, hostname);
@@ -429,12 +436,12 @@ mod buf_tests {
             count += 1;
         }
 
-        for ((host, addr), expected) in (&mut buffered).zip(v6.iter().copied().enumerate().map(
-            |(scope_id, bits)| Addr::V6 {
-                ip: Ipv6Addr::from_bits(bits),
+        for ((host, addr), expected) in
+            (&mut buffered).zip(v6.iter().copied().enumerate().map(|(scope_id, bits)| Addr {
+                ip: Ipv6Addr::from_bits(bits).into(),
                 scope_id: scope_id as u32,
-            },
-        )) {
+            }))
+        {
             assert_eq!(host, hostname);
             assert_eq!(addr, expected);
             count += 1;

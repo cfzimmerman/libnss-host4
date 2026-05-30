@@ -1,3 +1,14 @@
+//! `gethostbyname4_r` has three dimensions of return state
+//! defined in this module.
+//!
+//! - [`NssStatus`] is returned directly by the function.
+//! - [`HostStatus`] contextualizes an NSS host lookup result.
+//! - A [`libc`] return code explains general errors.
+//!
+//! The [`NssErr`] type holds all three and communicates them
+//! to the NSS caller as possible. Some common situations are
+//! already defined as constants in [`NssErr`].
+
 pub type NssRes<T> = Result<T, NssErr>;
 
 /// Contains the return information passed by this plugin
@@ -8,13 +19,13 @@ pub type NssRes<T> = Result<T, NssErr>;
 #[derive(Debug, PartialEq, Eq)]
 pub struct NssErr {
     /// A standard libc error.
-    c_err: i32,
-    nss: NssStatus,
-    dns: HostStatus,
+    pub c_err: i32,
+    pub nss: NssStatus,
+    pub dns: HostStatus,
 }
 
 impl NssErr {
-    /// The command succeeded. No error.
+    /// The command succeeded with results.
     pub const SUCCESS: Self = Self {
         c_err: 0,
         nss: NssStatus::Success,
@@ -28,26 +39,26 @@ impl NssErr {
         dns: HostStatus::NoData,
     };
 
-    /// For example, a hostname is not valid UTF-8, which is expected
-    /// by this library.
+    /// The macro wrapper returns this when a hostname is not valid UTF-8,
+    /// which is expected by this library.
     pub const INVALID_INPUT: Self = Self {
         c_err: libc::EINVAL,
         nss: NssStatus::Unavailable,
         dns: HostStatus::NoRecovery,
     };
 
-    /// This is a suitable return type for total plugin failure. For example,
-    /// if you're relying on unix sockets to communicate with a DNS server and
-    /// there are failures talking to the server.
+    /// This is a suitable return type for total failure.
+    /// For example, if there are I/O failures communicating with
+    /// an external DNS server.
     pub const PLUGIN_FAILED: Self = Self {
-        // IO is somewhat questionable here. Feel free to overwrite it
+        // IO is questionable here. Feel free to overwrite it
         // with something more appropriate for your context.
         c_err: libc::EIO,
         nss: NssStatus::Unavailable,
         dns: HostStatus::NoRecovery,
     };
 
-    /// The buffer containing requests results was too small. Retrying
+    /// The buffer containing request results was too small. Retrying
     /// with a larger buffer may succeed.
     pub(crate) const BUF_TOO_SMALL: Self = Self {
         c_err: libc::EAGAIN,
@@ -74,18 +85,18 @@ pub enum NssStatus {
     /// buffer is too small or the backing DNS service is overloaded.
     TryAgain = -2,
 
-    /// Plugin failure. For example, IPC or connectivity to some backing
-    /// DNS service failed.
+    /// Plugin failure. For example, a bug was detected and the library
+    /// decided to quit immediately.
     Unavailable,
 
     /// The query completed successfully without returning any matching hosts.
     /// Pairs with [`HostStatus::HostNotFound`].
     NotFound,
 
-    /// Request succeeded. Caller should check PAT list.
+    /// Request succeeded. Caller should check the linked list of results.
     Success,
     //
-    // Don't use `RETURN`? nss-mdns never does, and some cursory searching
+    // Don't use `RETURN`? nss-mdns never does, and some brief searching
     // suggests plugins should not return this value.
     // Return,
 }
